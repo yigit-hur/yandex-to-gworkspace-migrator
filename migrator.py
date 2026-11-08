@@ -1053,8 +1053,224 @@ def release_account_claim(user_email: str) -> None:
             fcntl.flock(lock_f, fcntl.LOCK_UN)
 
 
+def presync_existing_gmail_messages(
+    user_email: str,
+    app_password: str,
+    service,
+    imap: imaplib.IMAP4_SSL,
+    conn: sqlite3.Connection,
+    folders: List[Tuple[str, str, List[str], str]],
+    label_cache: Dict[str, str],
+    logger: logging.Logger,
+) -> imaplib.IMAP4_SSL:
+    """
+    Pre-Sync Reconciliation against existing Gmail messages (e.g. from a stalled Google DMS run).
+    1. Scans existing messages in the target Gmail mailbox, extracting RFC-5322 Message-ID headers
+       and existing labelIds via concurrent metadata fetches.
+    2. Scans Yandex IMAP folders using lightweight HEADER.FIELDS (MESSAGE-ID) + RFC822.SIZE fetches
+       (without downloading full email bodies).
+    3. Any Yandex UID whose Message-ID already exists in Gmail is recorded as MIGRATED in
+       migration_ledger.db ('Pre-existing in Gmail verified by RFC-5322 Message-ID') and, if missing
+       the folder's mapped Gmail label (e.g. SENT or a custom label), applies that label in Gmail.
+    """
+    logger.info(f"=== [Pre-Sync] Checking existing Gmail mailbox for {user_email} ===")
+    all_gmail_ids: List[str] = []
+    page_token = None
+    while True:
+        res = (
+            service.users()
+            .messages()
+            .list(userId="me", maxResults=500, includeSpamTrash=True, pageToken=page_token)
+            .execute()
+        )
+        msgs = res.get("messages", [])
+        for m in msgs:
+            all_gmail_ids.append(m["id"])
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+
+    if not all_gmail_ids:
+        logger.info(f"=== [Pre-Sync] Target Gmail mailbox is empty (0 messages); skipping pre-sync ===")
+        return imap
+
+    logger.info(
+        f"=== [Pre-Sync] Found {len(all_gmail_ids)} existing messages in Gmail; indexing RFC-5322 Message-IDs ==="
+    )
+    tls = threading.local()
+
+    def _fetch_gmail_meta(gid: str) -> Tuple[str, str, List[str]]:
+        svc = getattr(tls, "svc", None)
+        if svc is None:
+            svc = get_gmail_service(user_email)
+            tls.svc = svc
+        for att in range(1, 5):
+            try:
+                m = (
+                    svc.users()
+                    .messages()
+                    .get(
+                        userId="me",
+                        id=gid,
+                        format="metadata",
+                        metadataHeaders=["Message-ID", "Message-Id"],
+                    )
+                    .execute()
+                )
+                hdrs = m.get("payload", {}).get("headers", [])
+                mid = ""
+                for h in hdrs:
+                    if h.get("name", "").lower() == "message-id" and h.get("value"):
+                        mid = h["value"].strip().lower()
+                        break
+                return (gid, mid, m.get("labelIds", []) or [])
+            except Exception:
+                tls.svc = get_gmail_service(user_email)
+                time.sleep(0.5 * att)
+        return (gid, "", [])
+
+    msgid_to_gmail: Dict[str, Tuple[str, List[str]]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for idx, (gid, mid, lbls) in enumerate(pool.map(_fetch_gmail_meta, all_gmail_ids), 1):
+            if mid:
+                msgid_to_gmail[mid] = (gid, lbls)
+            if idx % 2000 == 0 or idx == len(all_gmail_ids):
+                logger.info(
+                    f"[Pre-Sync] Indexed {idx}/{len(all_gmail_ids)} Gmail headers ({len(msgid_to_gmail)} unique Message-IDs)"
+                )
+
+    total_matched = 0
+    for raw_folder, decoded_folder, flags, delim in folders:
+        target_label_name, is_system = map_folder_to_gmail_label(decoded_folder, flags, delim)
+        label_id = get_or_create_label_id(service, label_cache, target_label_name, is_system, logger)
+        quoted_mb = quote_imap_mailbox(raw_folder)
+        try:
+            typ, _ = imap.select(quoted_mb, readonly=True)
+            if typ != "OK":
+                continue
+            typ, uid_data = imap.uid("SEARCH", None, "ALL")
+            if typ != "OK" or not uid_data or not uid_data[0]:
+                continue
+            uids = uid_data[0].decode("ascii", errors="ignore").split()
+        except Exception:
+            imap = connect_yandex_imap(user_email, app_password)
+            continue
+
+        if not uids:
+            continue
+
+        cur = conn.execute(
+            "SELECT yandex_uid FROM messages WHERE user_email = ? AND folder = ? AND status IN ('MIGRATED', 'UNAVAILABLE')",
+            (user_email, decoded_folder),
+        )
+        already_recorded = {r[0] for r in cur.fetchall()}
+        scan_uids = [u for u in uids if u not in already_recorded]
+        if not scan_uids:
+            continue
+
+        folder_matched = 0
+        labels_to_add_gids: List[str] = []
+        for i in range(0, len(scan_uids), 500):
+            chunk = scan_uids[i : i + 500]
+            try:
+                typ, data = imap.uid(
+                    "FETCH",
+                    ",".join(chunk),
+                    "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+                )
+            except Exception:
+                imap = connect_yandex_imap(user_email, app_password)
+                imap.select(quoted_mb, readonly=True)
+                continue
+            if typ != "OK" or not data:
+                continue
+
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            rows_to_insert = []
+            for part in data:
+                if not isinstance(part, tuple) or len(part) < 2:
+                    continue
+                meta = part[0].decode("ascii", errors="ignore")
+                m_uid = re.search(r"\bUID\s+(\d+)\b", meta)
+                m_sz = re.search(r"\bRFC822\.SIZE\s+(\d+)\b", meta)
+                if not m_uid or part[1] is None:
+                    continue
+                u_s = m_uid.group(1)
+                sz_i = int(m_sz.group(1)) if m_sz else 0
+                mid_hdr = extract_message_id_header(part[1])
+                mid_key = mid_hdr.strip().lower()
+                if mid_key and mid_key in msgid_to_gmail:
+                    gid, existing_lbls = msgid_to_gmail[mid_key]
+                    rows_to_insert.append(
+                        (
+                            user_email,
+                            decoded_folder,
+                            u_s,
+                            mid_hdr,
+                            sz_i,
+                            gid,
+                            "Pre-existing in Gmail verified by RFC-5322 Message-ID",
+                            now_iso,
+                        )
+                    )
+                    if label_id and label_id not in existing_lbls:
+                        labels_to_add_gids.append(gid)
+
+            if rows_to_insert:
+                db_lock_path = BASE_DIR / ".db.lock"
+                with open(db_lock_path, "w") as lf:
+                    fcntl.flock(lf, fcntl.LOCK_EX)
+                    try:
+                        conn.executemany(
+                            """
+                            INSERT INTO messages (
+                                user_email, folder, yandex_uid, message_id_header,
+                                size_bytes, status, gmail_id, error_detail, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, 'MIGRATED', ?, ?, ?)
+                            ON CONFLICT(user_email, folder, yandex_uid) DO UPDATE SET
+                                message_id_header=excluded.message_id_header,
+                                size_bytes=excluded.size_bytes,
+                                status='MIGRATED',
+                                gmail_id=excluded.gmail_id,
+                                error_detail=excluded.error_detail,
+                                updated_at=excluded.updated_at
+                            """,
+                            rows_to_insert,
+                        )
+                        conn.commit()
+                    finally:
+                        fcntl.flock(lf, fcntl.LOCK_UN)
+                folder_matched += len(rows_to_insert)
+                total_matched += len(rows_to_insert)
+
+        # Ensure mapped folder label (e.g. SENT or custom label) is applied to pre-existing messages
+        if labels_to_add_gids and label_id:
+            for j in range(0, len(labels_to_add_gids), 1000):
+                batch_gids = labels_to_add_gids[j : j + 1000]
+                try:
+                    service.users().messages().batchModify(
+                        userId="me",
+                        body={"ids": batch_gids, "addLabelIds": [label_id]},
+                    ).execute()
+                except Exception as lbl_err:
+                    logger.warning(f"[Pre-Sync] batchModify label '{label_id}' warning: {lbl_err}")
+
+        if folder_matched > 0:
+            logger.info(
+                f"[Pre-Sync] Folder '{decoded_folder}': matched {folder_matched}/{len(scan_uids)} pre-existing Gmail messages"
+            )
+
+    logger.info(
+        f"=== [Pre-Sync] Completed for {user_email}: {total_matched} pre-existing Gmail messages reconciled ==="
+    )
+    return imap
+
+
 def migrate_account(
-    user_email: str, app_password: str, is_verification_pass: bool = False
+    user_email: str,
+    app_password: str,
+    is_verification_pass: bool = False,
+    presync_dms: Optional[bool] = None,
 ) -> int:
     logger = setup_logger(user_email)
     if not claim_account_for_worker(user_email, logger):
@@ -1071,6 +1287,27 @@ def migrate_account(
     logger.info(
         f"Discovered {len(folders)} selectable Yandex folders: {[f[1] for f in folders]}"
     )
+
+    # Run Pre-Sync Reconciliation if requested via --presync-dms, MIGRATOR_PRESYNC_DMS=1,
+    # or automatically on Pass 1 when the user has 0 existing rows in migration_ledger.db
+    if not is_verification_pass:
+        existing_ledger_rows = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE user_email = ?", (user_email,)
+        ).fetchone()[0]
+        env_presync = os.environ.get("MIGRATOR_PRESYNC_DMS", "auto").strip().lower()
+        should_presync = (
+            presync_dms
+            if presync_dms is not None
+            else (env_presync in ("1", "true", "yes") or (env_presync == "auto" and existing_ledger_rows == 0))
+        )
+        if should_presync:
+            try:
+                imap = presync_existing_gmail_messages(
+                    user_email, app_password, service, imap, conn, folders, label_cache, logger
+                )
+            except Exception as ps_err:
+                logger.warning(f"[Pre-Sync] Non-fatal pre-sync warning for {user_email}: {ps_err}")
+                imap = connect_yandex_imap(user_email, app_password)
 
     total_yandex_uids_live = 0
     folder_select_errors = 0
@@ -1489,6 +1726,16 @@ def main():
         action="store_true",
         help="Mark this run as the second Delta Verification Pass",
     )
+    parser.add_argument(
+        "--presync-dms",
+        action="store_true",
+        help="Force RFC-5322 Message-ID pre-sync against existing Gmail messages before importing",
+    )
+    parser.add_argument(
+        "--no-presync-dms",
+        action="store_true",
+        help="Disable automatic Message-ID pre-sync on initial pass",
+    )
     args = parser.parse_args()
 
     user_email = args.email.strip()
@@ -1500,10 +1747,12 @@ def main():
         )
         sys.exit(1)
 
+    presync_flag = True if args.presync_dms else (False if args.no_presync_dms else None)
     rc = migrate_account(
         user_email=user_email,
         app_password=app_password,
         is_verification_pass=args.verify,
+        presync_dms=presync_flag,
     )
     sys.exit(rc)
 
